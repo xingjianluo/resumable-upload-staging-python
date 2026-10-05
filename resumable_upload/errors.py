@@ -54,3 +54,23 @@ class MissingChunks(UploadError):
 
 class FinalChecksumMismatch(UploadError):
     reason = "final_checksum_mismatch"
+
+
+class QuotaExceeded(UploadError):
+    """暂存目录总容量不足；与过期、越权等原因明确区分。"""
+
+    reason = "quota_exceeded"
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        session_id: str | None = None,
+        used: int | None = None,
+        limit: int | None = None,
+        requested: int | None = None,
+    ):
+        super().__init__(message, session_id=session_id)
+        self.used = used
+        self.limit = limit
+        self.requested = requested

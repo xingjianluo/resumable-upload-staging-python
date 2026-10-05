@@ -25,6 +25,18 @@ def client(staging_dir: Path):
         yield c
 
 
+@pytest.fixture
+def quota_client(staging_dir: Path):
+    config = StagingConfig(
+        staging_dir=staging_dir, session_ttl_seconds=3600,
+        cleanup_interval_seconds=3600, chunk_max_bytes=4 * 1024 * 1024,
+        max_staging_bytes=256,
+    )
+    app = create_app(config)
+    with TestClient(app) as c:
+        yield c
+
+
 def _create(client, token, total_size, chunk_size, final_sum, filename="f.bin"):
     resp = client.post(
         "/uploads/sessions",
@@ -144,3 +156,79 @@ def test_final_checksum_mismatch_fails_commit(client):
                        headers={"X-Owner-Token": "alice"})
     assert resp.status_code == 422
     assert resp.json()["detail"]["reason"] == "final_checksum_mismatch"
+
+
+def test_renew_session_over_http(client):
+    data, chunks, final_sum = make_payload(512, 256)
+    created = _create(client, "alice", 512, 256, final_sum)
+    sid = created["session_id"]
+    assert _put_chunk(client, sid, "alice", 0, chunks[0]).status_code == 200
+
+    resp = client.post(
+        f"/uploads/sessions/{sid}/renew",
+        json={"extend_seconds": 7200},
+        headers={"X-Owner-Token": "alice"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body["expires_at"] > created["expires_at"]
+    # 已确认分片不变
+    assert body["received_chunks"] == [0]
+
+    # 省略 extend_seconds 时按默认 TTL 顺延，也应成功
+    default_renew = client.post(
+        f"/uploads/sessions/{sid}/renew", json={},
+        headers={"X-Owner-Token": "alice"},
+    )
+    assert default_renew.status_code == 200
+
+    # 越权续期 -> 403
+    forbidden = client.post(
+        f"/uploads/sessions/{sid}/renew", json={"extend_seconds": 60},
+        headers={"X-Owner-Token": "bob"},
+    )
+    assert forbidden.status_code == 403
+    assert forbidden.json()["detail"]["reason"] == "unauthorized"
+
+    # 非法 extend_seconds -> 400 invalid_request
+    bad = client.post(
+        f"/uploads/sessions/{sid}/renew", json={"extend_seconds": -1},
+        headers={"X-Owner-Token": "alice"},
+    )
+    assert bad.status_code == 400
+    assert bad.json()["detail"]["reason"] == "invalid_request"
+
+
+def test_quota_exceeded_over_http_returns_507(quota_client):
+    data, chunks, final_sum = make_payload(512, 256)
+    created = _create(quota_client, "alice", 512, 256, final_sum)
+    sid = created["session_id"]
+    assert _put_chunk(quota_client, sid, "alice", 0, chunks[0]).status_code == 200
+    # 第二个分片将使暂存占用达到 512 > 256 上限
+    resp = _put_chunk(quota_client, sid, "alice", 1, chunks[1])
+    assert resp.status_code == 507, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "quota_exceeded"
+    assert detail["quota"]["limit"] == 256
+    assert detail["quota"]["requested"] == 256
+    # 已确认分片未被破坏
+    progress = quota_client.get(
+        f"/uploads/sessions/{sid}", headers={"X-Owner-Token": "alice"}
+    ).json()
+    assert progress["received_chunks"] == [0]
+
+
+def test_quota_full_blocks_new_session_creation_over_http(quota_client):
+    data, chunks, final_sum = make_payload(256, 256)
+    first = _create(quota_client, "alice", 256, 256, final_sum)
+    assert _put_chunk(quota_client, first["session_id"], "alice", 0, chunks[0]).status_code == 200
+    # 暂存已满，再建会话被明确拒绝为 507 quota_exceeded，而非其他原因
+    resp = quota_client.post(
+        "/uploads/sessions",
+        json={"filename": "x", "total_size": 10, "chunk_size": 10,
+              "final_checksum": final_sum},
+        headers={"X-Owner-Token": "bob"},
+    )
+    assert resp.status_code == 507
+    assert resp.json()["detail"]["reason"] == "quota_exceeded"

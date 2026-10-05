@@ -1,18 +1,27 @@
-"""分片暂存的核心服务：会话生命周期、并发控制、提交与清理。
+"""分片暂存的核心服务：会话生命周期、跨进程并发控制、续期、容量约束、提交与清理。
 
 并发模型
 --------
-- 每个会话持有一把 :class:`threading.RLock`，同一会话的分片写入串行化，
-  保证并发写同一分片不会互相覆盖、进度更新不会丢失更新；
-- 不同会话使用不同的锁，天然相互隔离；
+- 每个会话持有一把跨进程组合锁（进程内线程锁 + 共享目录上的 flock），
+  同一暂存目录被多个 worker 进程/多个实例共享时，同一会话的分片写入、
+  续期、提交与回收仍然互斥，不会互相覆盖、丢失已确认进度或生成两份结果；
+- 不同会话使用不同的锁文件，天然相互隔离；
 - 分片数据与元数据均通过 "临时文件 + fsync + 原子 rename" 落盘，
   崩溃/重启后已确认（已写入元数据）的进度不会丢失。
 
+容量约束
+--------
+- 暂存总量由共享目录下的配额账本记录，所有账本读写在全局配额锁内完成；
+- 新建会话做容量预检，写分片时强制记账（预留 -> 写盘 -> 失败回退）；
+- 提交成功或会话被回收后，占用的暂存字节返还账本，可被后续上传复用。
+
 提交与清理
 ----------
-- 提交与会话清理都在会话锁内完成状态迁移，重复提交幂等且只会产生一份结果文件；
-- 过期清理只删除仍处于 PENDING 的会话；commit 会先对会话做过期判定，
-  因此 commit 与清理并发时结论确定：要么过期、要么唯一一次成功提交。
+- 提交、续期与会话清理都在会话锁内完成状态迁移，重复提交幂等且只会
+  产生一份结果文件；
+- 过期清理删除仍处于 PENDING（已过期）或 FAILED 的会话；commit/renew
+  会先对会话做有效期判定，因此与清理并发时结论确定：
+  要么过期/不存在，要么唯一一次成功。
 """
 
 from __future__ import annotations
@@ -31,41 +40,36 @@ from .errors import (
     ChunkTooLarge,
     FinalChecksumMismatch,
     MissingChunks,
+    QuotaExceeded,
     SessionAlreadyFinalized,
     SessionExpired,
     SessionFailed,
     SessionNotFound,
     UnauthorizedSession,
 )
+from .locking import LockManager
 from .models import ChunkState, SessionState, SessionStatus
+from .quota import QuotaExceededError, QuotaLedger
 from .storage import StagingStorage
 
 logger = logging.getLogger("resumable_upload")
 
 
 class UploadManager:
-    """对外提供创建会话、写入分片、查询进度、提交与清理能力。"""
+    """对外提供创建会话、写入分片、查询进度、续期、提交与清理能力。"""
 
     def __init__(self, config: StagingConfig | None = None):
         self.config = config or StagingConfig()
         self.storage = StagingStorage(self.config)
-        # 每个会话一把锁，保护同一会话内的并发写与状态迁移
-        self._session_locks: dict[str, threading.RLock] = {}
-        self._locks_guard = threading.Lock()
+        # 跨进程组合锁：锁文件位于共享暂存目录，对所有实例可见
+        self.locks = LockManager(self.storage.root)
+        self.quota = QuotaLedger(self.storage.root, self.config.max_staging_bytes)
         self._stop_event = threading.Event()
         self._cleanup_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
-    # 锁与后台任务
+    # 后台任务
     # ------------------------------------------------------------------
-    def _lock_for(self, session_id: str) -> threading.RLock:
-        with self._locks_guard:
-            lock = self._session_locks.get(session_id)
-            if lock is None:
-                lock = threading.RLock()
-                self._session_locks[session_id] = lock
-            return lock
-
     def start_cleanup_worker(self) -> None:
         if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
             return
@@ -123,8 +127,28 @@ class UploadManager:
             created_at=now,
             expires_at=now + self.config.session_ttl_seconds,
         )
-        # 先登记锁，再落盘，保证创建后立刻并发写也能串行化
-        self._lock_for(session.session_id)
+        # 容量预检：暂存空间已经被占满时，新建会话直接明确拒绝
+        # （reason=quota_exceeded），与 session_expired / unauthorized 区分。
+        # 不按声明大小提前预留：容量是在每个分片确认时逐片占用的，
+        # 声明大于当前剩余量的会话仍可创建（可等其他会话提交/回收释放后再传），
+        # 真正的上限强制发生在 put_chunk 的记账点。
+        if self.config.max_staging_bytes > 0:
+            with self.locks.quota_lock():
+                used = self.quota.load()
+            if used >= self.config.max_staging_bytes:
+                logger.warning(
+                    "session create rejected reason=quota_exceeded "
+                    "used=%d requested=%d limit=%d",
+                    used, total_size, self.config.max_staging_bytes,
+                )
+                raise QuotaExceeded(
+                    f"staging quota exhausted: used={used} limit={self.config.max_staging_bytes}",
+                    used=used,
+                    limit=self.config.max_staging_bytes,
+                    requested=total_size,
+                )
+        # 先建锁文件，再落盘，保证创建后立刻跨进程并发写也能串行化
+        self.locks.session_lock(session.session_id)
         self.storage.create_session_layout(session)
         logger.info(
             "session created session=%s owner=%s file=%s chunks=%d ttl=%.0fs",
@@ -198,8 +222,7 @@ class UploadManager:
         checksum: str,
     ) -> ChunkState:
         self._get_session(session_id, owner_token)
-        lock = self._lock_for(session_id)
-        with lock:
+        with self.locks.session_lock(session_id):
             # 磁盘状态是权威来源，锁内重新加载，避免使用过期内存视图
             session = self.storage.load_metadata(session_id)
             if session is None:
@@ -250,18 +273,50 @@ class UploadManager:
                     session_id=session_id,
                 )
 
-            # 先原子写数据，再更新元数据；两步之间崩溃只可能留下孤儿分片，
-            # 下次重传时会被原子覆盖，不会产生错误的"已确认"进度
-            self.storage.write_chunk_atomic(session_id, index, data, checksum)
-            state = ChunkState(
-                index=index, size=len(data), checksum=checksum, received_at=time.time()
-            )
-            session.chunks[index] = state
-            self.storage.save_metadata(session)
+            # 容量强制：在全局配额锁内做检查并预留本分片字节；锁内只做账本的
+            # 读改写，磁盘写放在配额锁外，避免长时间阻塞其他会话的配额检查。
+            size = len(data)
+            if self.config.max_staging_bytes > 0:
+                try:
+                    with self.locks.quota_lock():
+                        used_after = self.quota.charge(size)
+                except QuotaExceededError as exc:
+                    logger.warning(
+                        "chunk rejected session=%s chunk=%d reason=quota_exceeded "
+                        "used=%d requested=%d limit=%d",
+                        session_id, index, exc.used, size, exc.limit,
+                    )
+                    raise QuotaExceeded(
+                        f"staging quota exceeded: used={exc.used} requested={size} "
+                        f"limit={exc.limit}",
+                        session_id=session_id,
+                        used=exc.used,
+                        limit=exc.limit,
+                        requested=size,
+                    ) from exc
+            else:
+                used_after = None
+            try:
+                # 先原子写数据，再更新元数据；两步之间崩溃只可能留下孤儿分片，
+                # 下次重传时会被原子覆盖，recover 时按账本校准，不会产生错误的
+                # "已确认"进度，也不会长期高估占用。
+                self.storage.write_chunk_atomic(session_id, index, data, checksum)
+                state = ChunkState(
+                    index=index, size=size, checksum=checksum, received_at=time.time()
+                )
+                session.chunks[index] = state
+                self.storage.save_metadata(session)
+            except BaseException:
+                # 写盘/元数据落盘失败：回退本次预留，避免容量被"幽灵占用"
+                if self.config.max_staging_bytes > 0:
+                    with self.locks.quota_lock():
+                        self.quota.refund(size)
+                raise
             logger.info(
-                "chunk confirmed session=%s chunk=%d size=%d checksum=%s progress=%d/%d",
-                session_id, index, len(data), checksum,
+                "chunk confirmed session=%s chunk=%d size=%d checksum=%s progress=%d/%d%s",
+                session_id, index, size, checksum,
                 len(session.chunks), session.total_chunks,
+                f" quota_used={used_after}" if used_after is not None else "",
             )
             return state
 
@@ -270,8 +325,7 @@ class UploadManager:
     # ------------------------------------------------------------------
     def commit(self, session_id: str, owner_token: str) -> SessionState:
         self._get_session(session_id, owner_token)
-        lock = self._lock_for(session_id)
-        with lock:
+        with self.locks.session_lock(session_id):
             session = self.storage.load_metadata(session_id)
             if session is None:
                 logger.warning("commit rejected session=%s reason=session_not_found", session_id)
@@ -302,6 +356,7 @@ class UploadManager:
                     f"missing chunks: {missing}", missing=missing, session_id=session_id
                 )
 
+            staged_bytes = self.storage.staged_bytes(session)
             result_path = self.storage.assemble(session)
 
             hasher = hashlib.new(session.checksum_algorithm)
@@ -330,7 +385,20 @@ class UploadManager:
             session.status = SessionStatus.COMPLETED
             session.completed_at = time.time()
             session.result_path = str(result_path)
+            # 先发布 COMPLETED 元数据，再回收暂存分片：COMPLETED 是权威结论，
+            # 与任何实例上的回收/写入并发时，后者看到 COMPLETED 都不会再动数据。
             self.storage.save_metadata(session)
+            if staged_bytes:
+                self.storage.release_staged_chunks(session)
+                # 分片已落盘的字节是计费口径；meta 中的 chunks 记录保留用于
+                # 审计，实际磁盘占用已清零，在全局配额锁内返还账本。
+                if self.config.max_staging_bytes > 0:
+                    with self.locks.quota_lock():
+                        freed = self.quota.refund(staged_bytes)
+                    logger.info(
+                        "quota released session=%s bytes=%d quota_used=%d",
+                        session_id, staged_bytes, freed,
+                    )
             logger.info(
                 "commit completed session=%s chunks=%d result=%s checksum=%s",
                 session_id, session.total_chunks, result_path, actual_final,
@@ -338,44 +406,116 @@ class UploadManager:
             return session
 
     # ------------------------------------------------------------------
+    # 续期 / 保活
+    # ------------------------------------------------------------------
+    def renew_session(
+        self,
+        session_id: str,
+        owner_token: str,
+        extend_seconds: float | None = None,
+    ) -> SessionState:
+        """把进行中会话的有效期向后顺延。
+
+        - 仅 PENDING 且未过期的会话可续期；已完成/失败/过期分别按
+          session_finalized / session_failed / session_expired 拒绝；
+        - 续期只改 ``expires_at``，已确认分片、校验结论一律不变；
+        - 新的有效期在会话锁内 "读盘 -> 判定 -> 写盘"，与回收互斥，
+          二者撞车时结论唯一：续期成功则清理不会删它，清理先完成则续期
+          得到 session_not_found/expired；
+        - 延长后的过期时间持久化在 meta.json，重启不丢；
+        - 受 ``max_session_ttl_seconds``（相对创建时刻）上限约束。
+        """
+        if extend_seconds is None:
+            extend_seconds = self.config.session_ttl_seconds
+        if extend_seconds <= 0:
+            raise ValueError("extend_seconds must be > 0")
+        self._get_session(session_id, owner_token)
+        with self.locks.session_lock(session_id):
+            session = self.storage.load_metadata(session_id)
+            if session is None:
+                logger.warning("renew rejected session=%s reason=session_not_found", session_id)
+                raise SessionNotFound(session_id=session_id)
+            if session.status == SessionStatus.COMPLETED:
+                raise SessionAlreadyFinalized(session_id=session_id)
+            if session.status == SessionStatus.FAILED:
+                raise SessionFailed(
+                    f"session previously failed: {session.fail_reason}",
+                    session_id=session_id,
+                )
+            now = time.time()
+            if now > session.expires_at:
+                logger.warning(
+                    "renew rejected session=%s reason=session_expired now=%.3f expires_at=%.3f",
+                    session_id, now, session.expires_at,
+                )
+                raise SessionExpired(session_id=session_id)
+
+            new_expires = now + extend_seconds
+            cap = self.config.max_session_ttl_seconds
+            if cap and cap > 0:
+                upper = session.created_at + cap
+                if new_expires > upper:
+                    new_expires = upper
+            # 续期只能顺延：封顶或较短 extend 都不能把有效期缩到当前值之前
+            if new_expires < session.expires_at:
+                new_expires = session.expires_at
+            old_expires = session.expires_at
+            session.expires_at = new_expires
+            self.storage.save_metadata(session)
+            logger.info(
+                "session renewed session=%s old_expires_at=%.3f new_expires_at=%.3f "
+                "progress=%d/%d",
+                session_id, old_expires, new_expires,
+                len(session.chunks), session.total_chunks,
+            )
+            return session
+
+    # ------------------------------------------------------------------
     # 清理与恢复
     # ------------------------------------------------------------------
     def cleanup_expired(self, now: float | None = None) -> list[str]:
-        """删除过期且仍未完成的会话；已完成会话保留。返回被清理的会话 id。"""
+        """回收过期的 PENDING 会话与 FAILED 会话；已完成会话保留。
+
+        返回被清理的会话 id。会话判定与目录删除在跨进程会话锁内完成，
+        并在全局配额锁内把释放的字节返还账本。
+        """
         current = now if now is not None else time.time()
         removed: list[str] = []
         for session_id in self.storage.list_sessions():
-            lock = self._lock_for(session_id)
-            with lock:
+            with self.locks.session_lock(session_id):
                 session = self.storage.load_metadata(session_id)
                 if session is None:
                     continue
-                if session.status != SessionStatus.PENDING:
+                if session.status == SessionStatus.COMPLETED:
                     continue
-                if current <= session.expires_at:
+                # FAILED 会话不可再用，立即回收；PENDING 仅在过期后回收
+                if session.status == SessionStatus.PENDING and current <= session.expires_at:
                     continue
+                staged_bytes = self.storage.staged_bytes(session)
                 self.storage.remove_session(session_id)
+                if staged_bytes and self.config.max_staging_bytes > 0:
+                    with self.locks.quota_lock():
+                        self.quota.refund(staged_bytes)
                 logger.info(
-                    "session expired-removed session=%s expires_at=%.3f status=pending",
-                    session_id, session.expires_at,
+                    "session reaped session=%s status=%s expires_at=%.3f freed_bytes=%d",
+                    session_id, session.status.value, session.expires_at, staged_bytes,
                 )
                 removed.append(session_id)
-            # 已彻底删除后再摘除锁索引；删除本身在锁内，与 commit 互斥
-            if session_id in removed:
-                with self._locks_guard:
-                    self._session_locks.pop(session_id, None)
         return removed
 
     def recover(self) -> int:
-        """重启恢复：扫描暂存目录，重建锁索引并核对元数据与分片的一致性。
+        """重启恢复：扫描暂存目录，重建锁视图、校准配额账本并核对一致性。
 
         返回识别到的会话数量。已确认进度完全以磁盘上的 meta.json 为准，
-        因此重启后不会丢失；数据已写但元数据未更新的孤儿分片会被清除，
-        等待客户端重传该分片。
+        因此重启后不会丢失（包括续期后的 expires_at）；数据已写但元数据
+        未更新的孤儿分片会被清除，等待客户端重传该分片。容量账本按
+        磁盘实际已确认分片重新校准，崩溃窗口中"预留了但没写成"的字节
+        不会再占用配额。
         """
         recovered = 0
         for session_id in self.storage.list_sessions():
-            self._lock_for(session_id)
+            # 确保该会话的跨进程锁文件就绪
+            self.locks.session_lock(session_id)
             session = self.storage.load_metadata(session_id)
             if session is None:
                 continue
@@ -397,9 +537,13 @@ class UploadManager:
                             session_id, child.name,
                         )
             logger.info(
-                "recover session=%s status=%s progress=%d/%d",
+                "recover session=%s status=%s progress=%d/%d expires_at=%.3f",
                 session_id, session.status.value,
-                len(session.chunks), session.total_chunks,
+                len(session.chunks), session.total_chunks, session.expires_at,
             )
+        if self.config.max_staging_bytes > 0:
+            with self.locks.quota_lock():
+                used = self.quota.reconcile(self.storage.sessions_root())
+            logger.info("quota reconciled quota_used=%d limit=%d", used, self.config.max_staging_bytes)
         logger.info("recovery finished sessions=%d staging_dir=%s", recovered, self.storage.root)
         return recovered

@@ -146,3 +146,19 @@ class StagingStorage:
         import shutil
 
         shutil.rmtree(self.session_dir(session_id), ignore_errors=True)
+
+    def staged_bytes(self, session: SessionState) -> int:
+        """会话当前占用的暂存字节数（以已确认分片大小为准）。"""
+        return sum(chunk.size for chunk in session.chunks.values())
+
+    def release_staged_chunks(self, session: SessionState) -> None:
+        """提交成功后删除暂存分片，释放暂存配额。
+
+        最终文件已经原子落到 completed/ 并通过整文件校验，meta.json 与
+        completed 结果保留（重复提交仍幂等返回同一结果），仅回收 chunks/。
+        """
+        import shutil
+
+        chunks_dir = self.session_dir(session.session_id) / _CHUNKS_DIR
+        if chunks_dir.exists():
+            shutil.rmtree(chunks_dir, ignore_errors=True)

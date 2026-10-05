@@ -15,6 +15,12 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+# 默认执行 pytest 即打印涉及会话、分片序号与判定结论的日志，无需额外参数
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+log_cli_date_format = "%H:%M:%S"
+log_level = "INFO"
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"

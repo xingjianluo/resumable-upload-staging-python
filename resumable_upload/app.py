@@ -6,9 +6,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from .api import router as uploads_router
 from .config import StagingConfig
 from .manager import UploadManager
-from .api import router as uploads_router
 
 
 def create_app(config: StagingConfig | None = None) -> FastAPI:

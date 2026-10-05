@@ -144,3 +144,45 @@ def test_final_checksum_mismatch_fails_commit(client):
                        headers={"X-Owner-Token": "alice"})
     assert resp.status_code == 422
     assert resp.json()["detail"]["reason"] == "final_checksum_mismatch"
+
+
+def test_renew_over_http(client):
+    _, chunks, final_sum = make_payload(512, 256)
+    created = _create(client, "alice", 512, 256, final_sum)
+    sid = created["session_id"]
+    assert _put_chunk(client, sid, "alice", 0, chunks[0]).status_code == 200
+
+    resp = client.post(f"/uploads/sessions/{sid}/renew",
+                       headers={"X-Owner-Token": "alice"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["expires_at"] >= created["expires_at"]
+    # 已确认分片在续期后保持不变
+    assert body["received_chunks"] == [0]
+
+    # 越权续期 -> 403
+    resp = client.post(f"/uploads/sessions/{sid}/renew",
+                       headers={"X-Owner-Token": "mallory"})
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "unauthorized"
+
+
+def test_quota_exceeded_over_http(staging_dir: Path):
+    config = StagingConfig(staging_dir=staging_dir, session_ttl_seconds=3600,
+                           cleanup_interval_seconds=3600, max_staging_bytes=300)
+    with TestClient(create_app(config)) as client:
+        _, chunks, final_sum = make_payload(256, 256)
+        created = _create(client, "alice", 256, 256, final_sum)
+        sid = created["session_id"]
+        assert _put_chunk(client, sid, "alice", 0, chunks[0]).status_code == 200
+        # 已占 256，再建 256 的会话会超过 300 -> 507 quota_exceeded
+        resp = client.post(
+            "/uploads/sessions",
+            json={"filename": "b.bin", "total_size": 256, "chunk_size": 256,
+                  "final_checksum": final_sum},
+            headers={"X-Owner-Token": "bob"},
+        )
+        assert resp.status_code == 507
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "quota_exceeded"
+        assert detail["limit_bytes"] == 300

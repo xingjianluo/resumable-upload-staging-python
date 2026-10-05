@@ -4,6 +4,8 @@
 --------
 - 每个会话持有一把 :class:`threading.RLock`，同一会话的分片写入串行化，
   保证并发写同一分片不会互相覆盖、进度更新不会丢失更新；
+- 多进程/多实例共享同一暂存目录时，再在会话锁内套一把跨进程文件锁
+  （``locks/session-<id>.lock``，fcntl.flock），临界区扩展到整个机器范围；
 - 不同会话使用不同的锁，天然相互隔离；
 - 分片数据与元数据均通过 "临时文件 + fsync + 原子 rename" 落盘，
   崩溃/重启后已确认（已写入元数据）的进度不会丢失。
@@ -22,7 +24,6 @@ import logging
 import threading
 import time
 import uuid
-from pathlib import Path
 
 from .config import StagingConfig
 from .errors import (
@@ -31,6 +32,7 @@ from .errors import (
     ChunkTooLarge,
     FinalChecksumMismatch,
     MissingChunks,
+    QuotaExceeded,
     SessionAlreadyFinalized,
     SessionExpired,
     SessionFailed,
@@ -93,6 +95,27 @@ class UploadManager:
                 logger.exception("cleanup iteration failed")
 
     # ------------------------------------------------------------------
+    # 容量约束
+    # ------------------------------------------------------------------
+    def _check_quota(self, additional_bytes: int, session_id: str | None = None) -> None:
+        """容量预检：调用方必须已持有 quota_lock，且随后在同一锁内完成写入。"""
+        limit = self.config.max_staging_bytes
+        if limit is None:
+            return
+        usage = self.storage.usage_bytes()
+        if usage + additional_bytes > limit:
+            logger.warning(
+                "quota rejected session=%s reason=quota_exceeded usage=%d additional=%d limit=%d",
+                session_id, usage, additional_bytes, limit,
+            )
+            raise QuotaExceeded(
+                f"staging quota exceeded: usage={usage} + {additional_bytes} > limit={limit}",
+                usage_bytes=usage,
+                limit_bytes=limit,
+                session_id=session_id,
+            )
+
+    # ------------------------------------------------------------------
     # 会话生命周期
     # ------------------------------------------------------------------
     def create_session(
@@ -107,25 +130,29 @@ class UploadManager:
     ) -> SessionState:
         if total_size < 0 or chunk_size <= 0:
             raise ValueError("total_size must be >= 0 and chunk_size must be > 0")
-        total_chunks = (total_size + chunk_size - 1) // chunk_size if total_size else 0
-        if total_size == 0:
-            total_chunks = 0
-        now = time.time()
-        session = SessionState(
-            session_id=uuid.uuid4().hex,
-            owner_token=owner_token,
-            filename=filename,
-            total_chunks=total_chunks,
-            chunk_size=chunk_size,
-            total_size=total_size,
-            final_checksum=final_checksum,
-            checksum_algorithm=checksum_algorithm,
-            created_at=now,
-            expires_at=now + self.config.session_ttl_seconds,
-        )
-        # 先登记锁，再落盘，保证创建后立刻并发写也能串行化
-        self._lock_for(session.session_id)
-        self.storage.create_session_layout(session)
+        # 容量预检：按声明的总大小预留，检查与建目录在同一配额锁内，
+        # 多实例并发建会话时不会集体超配
+        with self.storage.quota_lock():
+            self._check_quota(total_size)
+            total_chunks = (total_size + chunk_size - 1) // chunk_size if total_size else 0
+            if total_size == 0:
+                total_chunks = 0
+            now = time.time()
+            session = SessionState(
+                session_id=uuid.uuid4().hex,
+                owner_token=owner_token,
+                filename=filename,
+                total_chunks=total_chunks,
+                chunk_size=chunk_size,
+                total_size=total_size,
+                final_checksum=final_checksum,
+                checksum_algorithm=checksum_algorithm,
+                created_at=now,
+                expires_at=now + self.config.session_ttl_seconds,
+            )
+            # 先登记锁，再落盘，保证创建后立刻并发写也能串行化
+            self._lock_for(session.session_id)
+            self.storage.create_session_layout(session)
         logger.info(
             "session created session=%s owner=%s file=%s chunks=%d ttl=%.0fs",
             session.session_id, owner_token, filename, total_chunks,
@@ -181,6 +208,43 @@ class UploadManager:
         }
 
     # ------------------------------------------------------------------
+    # 续期 / 保活
+    # ------------------------------------------------------------------
+    def renew_session(
+        self,
+        session_id: str,
+        owner_token: str,
+        extend_seconds: float | None = None,
+    ) -> SessionState:
+        """把进行中会话的有效期向后延长。
+
+        - 只延长不缩短：``expires_at = max(原值, now + 续期时长)``；
+        - 续期只改有效期，已确认分片与校验结论保持不变；
+        - 与过期清理共用同一把会话锁，二者竞争时结论唯一：
+          要么续期先落盘（清理看到新有效期跳过），要么会话已被回收（续期报 not_found）。
+        """
+        if extend_seconds is not None and extend_seconds <= 0:
+            raise ValueError("extend_seconds must be > 0")
+        ttl = extend_seconds if extend_seconds is not None else self.config.session_ttl_seconds
+        self._get_session(session_id, owner_token)
+        lock = self._lock_for(session_id)
+        with lock, self.storage.session_lock(session_id):
+            session = self.storage.load_metadata(session_id)
+            if session is None:
+                # 与过期清理竞争失败：会话已被回收
+                logger.warning("renew rejected session=%s reason=session_not_found", session_id)
+                raise SessionNotFound(session_id=session_id)
+            self._ensure_active(session)
+            new_expires_at = max(session.expires_at, time.time() + ttl)
+            session.expires_at = new_expires_at
+            self.storage.save_metadata(session)
+            logger.info(
+                "session renewed session=%s expires_at=%.3f confirmed_chunks=%d",
+                session_id, new_expires_at, len(session.chunks),
+            )
+            return session
+
+    # ------------------------------------------------------------------
     # 分片写入
     # ------------------------------------------------------------------
     def _checksum(self, algorithm: str, data: bytes) -> str:
@@ -199,7 +263,7 @@ class UploadManager:
     ) -> ChunkState:
         self._get_session(session_id, owner_token)
         lock = self._lock_for(session_id)
-        with lock:
+        with lock, self.storage.session_lock(session_id):
             # 磁盘状态是权威来源，锁内重新加载，避免使用过期内存视图
             session = self.storage.load_metadata(session_id)
             if session is None:
@@ -251,8 +315,11 @@ class UploadManager:
                 )
 
             # 先原子写数据，再更新元数据；两步之间崩溃只可能留下孤儿分片，
-            # 下次重传时会被原子覆盖，不会产生错误的"已确认"进度
-            self.storage.write_chunk_atomic(session_id, index, data, checksum)
+            # 下次重传时会被原子覆盖，不会产生错误的"已确认"进度。
+            # 容量检查与实际写入在同一把配额锁内，并发写入不会集体超限
+            with self.storage.quota_lock():
+                self._check_quota(len(data), session_id=session_id)
+                self.storage.write_chunk_atomic(session_id, index, data, checksum)
             state = ChunkState(
                 index=index, size=len(data), checksum=checksum, received_at=time.time()
             )
@@ -271,7 +338,7 @@ class UploadManager:
     def commit(self, session_id: str, owner_token: str) -> SessionState:
         self._get_session(session_id, owner_token)
         lock = self._lock_for(session_id)
-        with lock:
+        with lock, self.storage.session_lock(session_id):
             session = self.storage.load_metadata(session_id)
             if session is None:
                 logger.warning("commit rejected session=%s reason=session_not_found", session_id)
@@ -331,6 +398,9 @@ class UploadManager:
             session.completed_at = time.time()
             session.result_path = str(result_path)
             self.storage.save_metadata(session)
+            # 结果文件已落盘，分片副本可以安全删除以释放暂存空间；
+            # 崩溃窗口里残留的分片由 recover 对 COMPLETED 会话兜底清理
+            self.storage.discard_chunks(session_id)
             logger.info(
                 "commit completed session=%s chunks=%d result=%s checksum=%s",
                 session_id, session.total_chunks, result_path, actual_final,
@@ -341,29 +411,35 @@ class UploadManager:
     # 清理与恢复
     # ------------------------------------------------------------------
     def cleanup_expired(self, now: float | None = None) -> list[str]:
-        """删除过期且仍未完成的会话；已完成会话保留。返回被清理的会话 id。"""
+        """删除过期且仍未完成/已失败的会话；已完成会话保留。返回被清理的会话 id。
+
+        - PENDING 过期：正常过期回收；
+        - FAILED 过期：失败会话的分片也是可回收垃圾，过期后一并清除释放空间；
+        - COMPLETED：无论是否到期都保留（结果文件仍可能被下载）。
+        """
         current = now if now is not None else time.time()
         removed: list[str] = []
         for session_id in self.storage.list_sessions():
             lock = self._lock_for(session_id)
-            with lock:
+            with lock, self.storage.session_lock(session_id):
                 session = self.storage.load_metadata(session_id)
                 if session is None:
                     continue
-                if session.status != SessionStatus.PENDING:
+                if session.status not in (SessionStatus.PENDING, SessionStatus.FAILED):
                     continue
                 if current <= session.expires_at:
                     continue
                 self.storage.remove_session(session_id)
                 logger.info(
-                    "session expired-removed session=%s expires_at=%.3f status=pending",
-                    session_id, session.expires_at,
+                    "session expired-removed session=%s expires_at=%.3f status=%s",
+                    session_id, session.expires_at, session.status.value,
                 )
                 removed.append(session_id)
-            # 已彻底删除后再摘除锁索引；删除本身在锁内，与 commit 互斥
+            # 已彻底删除后再摘除锁索引与锁文件；删除本身在锁内，与 commit 互斥
             if session_id in removed:
                 with self._locks_guard:
                     self._session_locks.pop(session_id, None)
+                self.storage.discard_session_lock(session_id)
         return removed
 
     def recover(self) -> int:
@@ -381,7 +457,15 @@ class UploadManager:
                 continue
             recovered += 1
             chunks_dir = self.storage.session_dir(session_id) / "chunks"
-            if chunks_dir.exists():
+            if session.status == SessionStatus.COMPLETED:
+                # 提交成功后分片副本即冗余；崩溃窗口里没删干净的在这里兜底
+                if chunks_dir.exists():
+                    self.storage.discard_chunks(session_id)
+                    logger.info(
+                        "recover completed-session session=%s action=discard_chunks",
+                        session_id,
+                    )
+            elif chunks_dir.exists():
                 confirmed = set(session.chunks.keys())
                 for child in chunks_dir.iterdir():
                     if not child.is_file():

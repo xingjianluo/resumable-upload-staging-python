@@ -72,7 +72,7 @@ class SessionState:
         }
 
     @classmethod
-    def from_metadata_dict(cls, data: dict) -> "SessionState":
+    def from_metadata_dict(cls, data: dict) -> SessionState:
         """从 JSON 字典恢复会话状态。"""
         chunks = {
             int(item["index"]): ChunkState(

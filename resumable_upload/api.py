@@ -17,6 +17,7 @@ from .errors import (
     ChunkTooLarge,
     FinalChecksumMismatch,
     MissingChunks,
+    QuotaExceeded,
     SessionAlreadyFinalized,
     SessionExpired,
     SessionFailed,
@@ -42,6 +43,7 @@ _STATUS_BY_REASON = {
     ChecksumMismatch.reason: 422,
     MissingChunks.reason: 409,
     FinalChecksumMismatch.reason: 422,
+    QuotaExceeded.reason: 507,
 }
 
 
@@ -61,6 +63,10 @@ class CreateSessionResponse(BaseModel):
     status: str
 
 
+class RenewSessionRequest(BaseModel):
+    extend_seconds: float | None = None
+
+
 def get_manager(request: Request) -> UploadManager:
     return request.app.state.upload_manager
 
@@ -70,6 +76,9 @@ def _raise_http(exc: UploadError) -> None:
     detail = {"reason": exc.reason, "message": exc.message}
     if isinstance(exc, MissingChunks):
         detail["missing_chunks"] = exc.missing
+    if isinstance(exc, QuotaExceeded):
+        detail["usage_bytes"] = exc.usage_bytes
+        detail["limit_bytes"] = exc.limit_bytes
     logger.warning(
         "http reject reason=%s status=%d session=%s", exc.reason, status, exc.session_id
     )
@@ -93,6 +102,8 @@ def create_session(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={"reason": "invalid_request", "message": str(exc)})
+    except UploadError as exc:
+        _raise_http(exc)
     return CreateSessionResponse(
         session_id=session.session_id,
         expires_at=session.expires_at,
@@ -135,6 +146,30 @@ async def put_chunk(
         "size": state.size,
         "checksum": state.checksum,
         "acknowledged": True,
+    }
+
+
+@router.post("/sessions/{session_id}/renew")
+def renew_session(
+    session_id: str,
+    request: Request,
+    x_owner_token: str = Header(..., alias="X-Owner-Token"),
+    body: RenewSessionRequest | None = None,
+) -> dict:
+    extend = body.extend_seconds if body else None
+    try:
+        session = get_manager(request).renew_session(
+            session_id, x_owner_token, extend_seconds=extend
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"reason": "invalid_request", "message": str(exc)})
+    except UploadError as exc:
+        _raise_http(exc)
+    return {
+        "session_id": session.session_id,
+        "status": session.status.value,
+        "expires_at": session.expires_at,
+        "received_chunks": sorted(session.chunks.keys()),
     }
 
 

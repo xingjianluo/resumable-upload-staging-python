@@ -19,12 +19,15 @@ import tempfile
 from pathlib import Path
 
 from .config import StagingConfig
+from .locks import FileLock
 from .models import SessionState
 
 _METADATA_NAME = "meta.json"
 _CHUNKS_DIR = "chunks"
 _SESSIONS_DIR = "sessions"
 _COMPLETED_DIR = "completed"
+_LOCKS_DIR = "locks"
+_QUOTA_LOCK_NAME = "quota.lock"
 
 
 def _safe_filename(filename: str) -> str:
@@ -61,6 +64,56 @@ class StagingStorage:
         safe = _safe_filename(session.filename)
         return self.completed_root() / f"{session.session_id}-{safe}"
 
+    # ---- 跨进程锁 ----
+    def session_lock(self, session_id: str) -> FileLock:
+        """会话级跨进程锁：同一会话的写/提交/续期/回收互斥。"""
+        return FileLock(self.root / _LOCKS_DIR / f"session-{session_id}.lock")
+
+    def quota_lock(self) -> FileLock:
+        """全局容量锁：用量统计与"检查+写入"必须在同一把锁内完成。"""
+        return FileLock(self.root / _LOCKS_DIR / _QUOTA_LOCK_NAME)
+
+    def discard_session_lock(self, session_id: str) -> None:
+        """会话彻底删除后清理其锁文件（best-effort，避免锁文件无限增长）。"""
+        (self.root / _LOCKS_DIR / f"session-{session_id}.lock").unlink(missing_ok=True)
+
+    # ---- 容量 ----
+    def usage_bytes(self) -> int:
+        """暂存目录当前占用：已确认分片 + 已完成结果文件的字节数。
+
+        元数据（meta.json）与锁文件属于固定小开销，不计入配额，
+        这样配额语义与"上传数据量"一致，便于配置与推算。
+        """
+        total = 0
+        sessions = self.sessions_root()
+        if sessions.exists():
+            for session_dir in sessions.iterdir():
+                chunks_dir = session_dir / _CHUNKS_DIR
+                try:
+                    children = list(chunks_dir.iterdir())
+                except FileNotFoundError:
+                    # 与并发清理竞争：会话目录可能刚被整体删除
+                    continue
+                for child in children:
+                    try:
+                        if child.is_file():
+                            total += child.stat().st_size
+                    except FileNotFoundError:
+                        continue
+        completed = self.completed_root()
+        if completed.exists():
+            try:
+                completed_children = list(completed.iterdir())
+            except FileNotFoundError:
+                completed_children = []
+            for child in completed_children:
+                try:
+                    if child.is_file():
+                        total += child.stat().st_size
+                except FileNotFoundError:
+                    continue
+        return total
+
     # ---- 会话元数据 ----
     def create_session_layout(self, session: SessionState) -> None:
         """建立会话目录结构并写入第一版元数据。"""
@@ -90,10 +143,12 @@ class StagingStorage:
 
     def load_metadata(self, session_id: str) -> SessionState | None:
         path = self.metadata_path(session_id)
-        if not path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return SessionState.from_metadata_dict(json.load(f))
+        except FileNotFoundError:
+            # 与并发清理竞争：exists 到 open 之间会话目录可能刚被删除
             return None
-        with path.open("r", encoding="utf-8") as f:
-            return SessionState.from_metadata_dict(json.load(f))
 
     def list_sessions(self) -> list[str]:
         root = self.sessions_root()
@@ -142,6 +197,12 @@ class StagingStorage:
         return target
 
     # ---- 清理 ----
+    def discard_chunks(self, session_id: str) -> None:
+        """删除会话的全部分片（提交成功后释放空间；崩溃恢复时兜底）。"""
+        import shutil
+
+        shutil.rmtree(self.session_dir(session_id) / _CHUNKS_DIR, ignore_errors=True)
+
     def remove_session(self, session_id: str) -> None:
         import shutil
 

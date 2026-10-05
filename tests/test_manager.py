@@ -277,8 +277,9 @@ def test_cleanup_removes_only_expired_pending_sessions(staging_dir: Path):
 
 
 def test_commit_and_cleanup_race_has_deterministic_outcome(staging_dir: Path):
-    # TTL 极短：commit 与 cleanup 并发，结论只能是"过期拒绝"或"唯一成功"之一
-    config = StagingConfig(staging_dir=staging_dir, session_ttl_seconds=0.05)
+    # commit 与 cleanup 并发，结论只能是"过期拒绝"或"唯一成功"之一。
+    # 有效期在传完分片后被人为拨到"即将过期"，避免上传本身受机器负载影响而超时
+    config = StagingConfig(staging_dir=staging_dir, session_ttl_seconds=3600)
     manager = UploadManager(config)
     data, chunks, final_sum = make_payload(500, 250)
     outcomes = {"expired": 0, "success": 0, "missing": 0}
@@ -289,6 +290,10 @@ def test_commit_and_cleanup_race_has_deterministic_outcome(staging_dir: Path):
             final_checksum=final_sum, owner_token="alice",
         )
         _upload_all_chunks(manager, session, "alice", chunks)
+        # 把有效期拨到 40ms 后，制造 commit 与 cleanup 的竞态窗口
+        state = manager.storage.load_metadata(session.session_id)
+        state.expires_at = time.time() + 0.04
+        manager.storage.save_metadata(state)
         time.sleep(0.04)  # 逼近过期时刻
         commit_result: list = []
         t1 = threading.Thread(target=lambda: _collect_commit(manager, session.session_id, commit_result))

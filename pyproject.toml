@@ -15,6 +15,11 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+# 默认跑单测即输出业务日志：能看到会话、分片序号与判定结论，无需额外参数
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+log_cli_date_format = "%H:%M:%S.%f"
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
